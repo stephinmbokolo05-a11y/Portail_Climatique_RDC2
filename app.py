@@ -1,4 +1,233 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+build_hf_space.py
+=================
+ÉTAPE 4 : produit, EN UNE COMMANDE, un Hugging Face Space (application Streamlit) de même
+type que l'Atlas de référence, à partir de votre base drc_climate_atlas.db :
+
+    D:\\Portail_Climatique_RDC\\ATLAS\\space_hf\\
+        app.py  Dockerfile  README.md  requirements.txt
+        data\\*.csv.gz  provinces.geojson  meta.json      (quelques Mo au total)
+
+L'application contient : portrait national · carte (≈40 couches) · fiche province (climat,
+séries + tendances, sources de pluie, SPI, exposition, fiche à télécharger) · comparaison de
+provinces · tendances et fiabilité (NASA/ERA5/GPCC/TAMSAT) · projections 2026-2040 ·
+problèmes et risques (chaleur, pluies fortes, saisons sèches, variabilité, paludisme) ·
+téléchargement des données · méthodes et limites.
+
+USAGE
+  python build_hf_space.py                        # fabrique le dossier space_hf
+  pip install streamlit plotly                    # (pour tester en local)
+  cd space_hf && streamlit run app.py             # test local : http://localhost:8501
+
+  Publication sur Hugging Face (compte gratuit + jeton « write » : huggingface.co/settings/tokens) :
+  pip install huggingface_hub
+  set HF_TOKEN=hf_xxx                             # (PowerShell : $env:HF_TOKEN="hf_xxx")
+  python build_hf_space.py --upload --repo-id VOTRE_NOM/Atlas_Climatique_RDC
+"""
+import argparse
+import json
+import os
+import re
+import sqlite3
+import sys
+import unicodedata
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+BASE_DIR = Path(r"D:\Portail_Climatique_RDC\ATLAS")
+SOURCES = ["nasa", "era5", "gpcc", "tamsat", "chirps"]
+
+def norm(s):
+    s = unicodedata.normalize("NFD", str(s or ""))
+    return "".join(c for c in s if unicodedata.category(c) != "Mn" and c.isalnum()).lower()
+
+
+def tbl(conn, name):
+    try:
+        return pd.read_sql(f"SELECT * FROM {name}", conn)
+    except Exception:
+        return pd.DataFrame()
+
+
+def num(x, d=3):
+    try:
+        x = float(x)
+        return round(x, d) if np.isfinite(x) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def rdp(pts, tol):
+    pts = np.asarray(pts, float)
+    n = len(pts)
+    if n < 4:
+        return pts
+    keep = np.zeros(n, bool)
+    keep[0] = keep[-1] = True
+    stack = [(0, n - 1)]
+    while stack:
+        i, j = stack.pop()
+        seg = pts[i + 1:j]
+        if len(seg) == 0:
+            continue
+        a, b = pts[i], pts[j]
+        ab = b - a
+        L = np.hypot(*ab)
+        d = (np.abs(ab[0] * (seg[:, 1] - a[1]) - ab[1] * (seg[:, 0] - a[0])) / L) if L > 0 \
+            else np.hypot(seg[:, 0] - a[0], seg[:, 1] - a[1])
+        k = int(np.argmax(d))
+        if d[k] > tol:
+            keep[i + 1 + k] = True
+            stack += [(i, i + 1 + k), (i + 1 + k, j)]
+    return pts[keep]
+
+
+def geometry(g, tol=0.012):
+    if not isinstance(g, str) or not g:
+        return []
+    gj = json.loads(g)
+    polys = gj["coordinates"] if gj["type"] == "MultiPolygon" else [gj["coordinates"]]
+    out = []
+    for poly in polys:
+        r = np.asarray(poly[0], float)
+        if (r[:, 0].max() - r[:, 0].min()) < 0.06 and (r[:, 1].max() - r[:, 1].min()) < 0.06:
+            continue                                   # micro-îlots
+        s = rdp(r, tol)
+        if len(s) >= 4:
+            out.append([[round(x, 3), round(y, 3)] for x, y in s])
+    return out
+
+
+def anchor(label):
+    s = str(label).lower()
+    yrs = [int(y) for y in re.findall(r"(?:19|20|21)\d{2}", s)]
+    if len(yrs) >= 2:
+        return (yrs[0] + yrs[1]) / 2 + 0.5
+    if "hist" in s or "base" in s or "ref" in s:
+        return 1999.5
+    if "near" in s or "proche" in s or "mid" in s:
+        return 2032.5
+    if "far" in s or "long" in s or "lointain" in s:
+        return 2075.5
+    return None
+
+
+def projections(conn, provs, normals, rain_base):
+    ci = tbl(conn, "atlas_cmip6_indicators")
+    if ci.empty:
+        return None, "table atlas_cmip6_indicators absente"
+    cols = list(ci.columns)
+    pc = next((c for c in cols if re.search(r"prov|admin|name|region", c, re.I)), None)
+    strc = [c for c in cols if c != pc and not pd.api.types.is_numeric_dtype(ci[c]) and 2 <= ci[c].nunique() <= 6]
+    if pc is None or not strc:
+        return None, f"colonnes province/période non reconnues : {cols}"
+    per = strc[0]
+    anchors = {v: anchor(v) for v in ci[per].unique()}
+    if any(a is None for a in anchors.values()):
+        return None, f"périodes non reconnues : {list(anchors)}"
+    numc = [c for c in cols if c not in (pc, per) and pd.api.types.is_numeric_dtype(ci[c])
+            and not re.search(r"^(lat|lon|id|year)", c, re.I)]
+    idx = {norm(r.label): r.code for r in provs.itertuples()}
+    idx.update({norm(r.code): r.code for r in provs.itertuples()})
+    years = list(range(2026, 2041))
+    order = sorted(anchors, key=anchors.get)
+    xs = [anchors[o] for o in order]
+    out, base, meta = {}, {}, []
+    for c in numc:
+        low = c.lower()
+        kind = ("temp" if re.search(r"temp|tas|t2m", low) and not re.search(r"dry|wet|freq", low) else
+                "rain" if re.search(r"precip|rain|prcp|^pr", low)
+                and not re.search(r"intens|heavy|freq|dry|wet|cv|var|extreme|day", low) else "raw")
+        meta.append(dict(id=c, kind=kind))
+    for r_code, g in ci.groupby(ci[pc].map(lambda v: idx.get(norm(v)))):
+        if r_code is None:
+            continue
+        g = g.set_index(per)
+        out[r_code], base[r_code] = {}, {}
+        for m in meta:
+            ys = [num(g.loc[o, m["id"]], 6) if o in g.index else None for o in order]
+            if any(v is None for v in ys):
+                continue
+            vals = np.interp(years, xs, ys)
+            hist = ys[0]
+            if m["kind"] == "temp" and (r_code, "TMEAN") in normals:
+                b = normals[(r_code, "TMEAN")]
+                vals = b + (vals - hist)
+                base[r_code][m["id"]] = b
+            elif m["kind"] == "rain" and r_code in rain_base and hist:
+                b = rain_base[r_code]
+                vals = b * vals / hist
+                base[r_code][m["id"]] = b
+            else:
+                base[r_code][m["id"]] = hist
+            out[r_code][m["id"]] = [round(float(v), 3) for v in vals]
+    if not out:
+        return None, "aucune province appariée dans atlas_cmip6_indicators"
+    lab = {"temp": "Température moyenne (°C), corrigée du biais",
+           "rain": "Pluie annuelle (mm), corrigée du biais"}
+    for m in meta:
+        m["label"] = lab.get(m["kind"], m["id"].replace("_", " "))
+        m["unit"] = {"temp": "°C", "rain": "mm"}.get(m["kind"], "valeur du jeu")
+        m["dec"] = {"temp": 2, "rain": 0}.get(m["kind"], 2)
+    meta = [m for m in meta if any(m["id"] in v for v in out.values())]
+    return dict(years=years, cols=meta, data=out, base=base,
+                periods={str(k): v for k, v in anchors.items()}), "ok"
+
+
+README = """---
+title: Atlas climatique RDC
+emoji: 🌍
+colorFrom: green
+colorTo: blue
+sdk: docker
+app_port: 8501
+pinned: false
+license: mit
+short_description: Climat, tendances et projections des provinces de la RDC
+---
+
+# Atlas climatique de la RDC
+
+Normales 1991-2020 · tendances 1981-2024 · fiabilité (NASA POWER, ERA5, GPCC, TAMSAT) · projections 2026-2040 (CMIP6).
+Application Streamlit : portrait national, carte, fiches provinces, comparaison, risques, données téléchargeables.
+
+**Limites** : la tendance de la pluie n'est pas établie (sources en désaccord) ; projections issues d'un seul modèle et d'un scénario très émetteur (SSP5-8.5).
+"""
+
+DOCKERFILE = """FROM python:3.11-slim
+ENV PYTHONUNBUFFERED=1 STREAMLIT_BROWSER_GATHER_USAGE_STATS=false STREAMLIT_SERVER_HEADLESS=true
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+EXPOSE 8501
+CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.enableXsrfProtection=false", "--server.enableCORS=false", "--theme.base=light", "--theme.primaryColor=#1f7a4d", "--theme.backgroundColor=#f7f6f1", "--theme.secondaryBackgroundColor=#ecebe3", "--theme.textColor=#1d2a24"]
+"""
+
+STREAMLIT_CONFIG = """[theme]
+base = "light"
+primaryColor = "#1f7a4d"
+backgroundColor = "#f7f6f1"
+secondaryBackgroundColor = "#ecebe3"
+textColor = "#1d2a24"
+
+[server]
+headless = true
+enableXsrfProtection = false
+enableCORS = false
+
+[browser]
+gatherUsageStats = false
+"""
+
+REQUIREMENTS = "streamlit>=1.37,<1.50\npandas>=2.0\nnumpy>=1.26\nplotly>=5.20\n"
+
+APP_SOURCE = r'''# -*- coding: utf-8 -*-
 """Atlas climatique de la RDC : application Streamlit (Hugging Face Space)."""
 import json
 import re
@@ -578,3 +807,154 @@ PAGES[st.sidebar.radio("Navigation", list(PAGES), label_visibility="collapsed")]
 st.sidebar.markdown("---")
 st.sidebar.caption("Données : NASA POWER, ERA5, GPCC, TAMSAT, CMIP6. Voir « Méthodes » pour les limites.")
 st.markdown('<div class="foot">Atlas climatique de la RDC · tendances de pluie non établies · projections indicatives (modèle et scénario uniques)</div>', unsafe_allow_html=True)
+'''
+
+
+def log(m):
+    print(m, flush=True)
+
+
+def export(conn, out):
+    data = out / "data"
+    data.mkdir(parents=True, exist_ok=True)
+
+    def save(name, df):
+        if df is not None and len(df):
+            df.to_csv(data / f"{name}.csv.gz", index=False, compression="gzip", float_format="%.5g")
+            log(f"  data/{name}.csv.gz  ({len(df)} lignes)")
+        else:
+            log(f"  (absent) {name}")
+
+    prov = tbl(conn, "provinces")
+    if prov.empty:
+        sys.exit("Table provinces vide : lancez build_drc_climate_db.py")
+    save("provinces", prov[["code", "label", "zone"]])
+    feats = []
+    for r in prov.itertuples():
+        rings = geometry(r.geometry_geojson)
+        if rings:
+            feats.append(dict(type="Feature", properties=dict(code=r.code, label=r.label, zone=r.zone),
+                              geometry=dict(type="MultiPolygon", coordinates=[[ring] for ring in rings])))
+    (data / "provinces.geojson").write_text(json.dumps(dict(type="FeatureCollection", features=feats)), encoding="utf-8")
+    log(f"  data/provinces.geojson  ({len(feats)} provinces)")
+
+    nm = tbl(conn, "an_normals")
+    if nm.empty:
+        sys.exit("Tables d'analyse absentes : lancez analyze_drc_climate.py")
+    save("normals", nm)
+    save("clim", tbl(conn, "an_monthly_climatology"))
+    save("regime", tbl(conn, "an_regime"))
+    save("trends", tbl(conn, "an_trends"))
+    save("annual", tbl(conn, "an_annual_indices"))
+    spi = tbl(conn, "an_spi")
+    save("spi", spi[spi.scale.isin([3, 12])] if len(spi) else spi)
+    save("spi_annual", tbl(conn, "an_spi_annual"))
+    save("hazard", tbl(conn, "an_hazard_scores"))
+    cons = tbl(conn, "an_rain_consensus")
+    save("consensus", cons)
+    save("validation", tbl(conn, "an_validation_trends"))
+    save("breaks", tbl(conn, "an_validation_breaks"))
+    save("nasa_monthly", tbl(conn, "v_nasa_monthly"))
+
+    # pluie annuelle par source (long) + NATIONAL
+    ser = {}
+    na = tbl(conn, "v_nasa_annual")
+    if len(na):
+        ser["nasa"] = na.rename(columns={"prcptot_mm": "mm"})[["province", "year", "mm"]]
+    try:
+        era = pd.read_sql("""SELECT province,year,SUM(precip_mm) mm,COUNT(precip_mm) n FROM obs_era5_daily
+                             GROUP BY province,year HAVING n>=330""", conn)
+        if len(era):
+            ser["era5"] = era[["province", "year", "mm"]]
+    except Exception:
+        pass
+    ind = tbl(conn, "obs_rain_indep_monthly")
+    for s, g in ind.groupby("source") if len(ind) else []:
+        c = g.groupby(["province", "year"]).precip_mm.agg(["sum", "count"]).reset_index()
+        ser[s] = c[c["count"] == 12].rename(columns={"sum": "mm"})[["province", "year", "mm"]]
+    rows = []
+    common = sorted(set.intersection(*[set(d.province) for d in ser.values()])) if ser else []
+    for s, d in ser.items():
+        rows.append(d.assign(source=s))
+        nat = d[d.province.isin(common)].groupby("year").mm.mean().reset_index()
+        rows.append(nat.assign(province="NATIONAL", source=s))
+    rain = pd.concat(rows, ignore_index=True)[["source", "province", "year", "mm"]] if rows else pd.DataFrame()
+    save("rain_sources", rain)
+
+    # projections (long)
+    nbase = {(r.province, "TMEAN"): float(r.normal) for r in nm.itertuples() if r.indicator == "TMEAN"}
+    rb = {}
+    for r in nm[nm.indicator == "PRCPTOT"].itertuples():
+        vals = [float(r.normal)]
+        for s in ("gpcc", "tamsat"):
+            if s in ser:
+                x = ser[s][(ser[s].province == r.province) & ser[s].year.between(1991, 2020)].mm
+                if len(x):
+                    vals.append(float(x.mean()))
+        rb[r.province] = float(np.median(vals))
+    proj, why = projections(conn, prov, nbase, rb)
+    log(f"  projections : {why}")
+    if proj:
+        recs = []
+        for code, cols in proj["data"].items():
+            for m in proj["cols"]:
+                if m["id"] in cols:
+                    for y, v in zip(proj["years"], cols[m["id"]]):
+                        recs.append(dict(province=code, indicator=m["id"], kind=m["kind"], label=m["label"], unit=m["unit"],
+                                         year=y, value=v, base=proj["base"][code].get(m["id"])))
+        save("proj", pd.DataFrame(recs))
+
+    verdict = cons.verdict_global.iloc[0] if len(cons) else None
+    v = (verdict or "").upper()
+    status = ("non_etablie" if ("NON" in v or "INCONCLUANT" in v) else "partielle" if "PARTIELLEMENT" in v
+              else "corroboree" if "CORROB" in v else "inconnue")
+    md = tbl(conn, "metadata")
+    md = dict(zip(md.key, md.value)) if len(md) else {}
+    (data / "meta.json").write_text(json.dumps(dict(
+        built=datetime.now().strftime("%d/%m/%Y %H:%M"), analysis=md.get("analysis_periods", ""),
+        verdict=verdict, rain_status=status, sources=sorted(ser)), ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--base-dir", default=str(BASE_DIR))
+    ap.add_argument("--db", default="drc_climate_atlas.db")
+    ap.add_argument("--out", default="space_hf")
+    ap.add_argument("--upload", action="store_true", help="publier sur Hugging Face")
+    ap.add_argument("--repo-id", default="", help="ex. moncompte/Atlas_Climatique_RDC")
+    a, _ = ap.parse_known_args()
+    base = Path(a.base_dir)
+    dbp = Path(a.db) if Path(a.db).is_absolute() else base / a.db
+    if not dbp.exists():
+        sys.exit(f"Base introuvable : {dbp}")
+    out = Path(a.out) if Path(a.out).is_absolute() else base / a.out
+    out.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(dbp)
+    log("Export des données ...")
+    export(conn, out)
+    conn.close()
+    (out / "app.py").write_text(APP_SOURCE, encoding="utf-8")
+    (out / "README.md").write_text(README, encoding="utf-8")
+    (out / "Dockerfile").write_text(DOCKERFILE, encoding="utf-8")
+    (out / "requirements.txt").write_text(REQUIREMENTS, encoding="utf-8")
+    (out / ".streamlit").mkdir(exist_ok=True)
+    (out / ".streamlit" / "config.toml").write_text(STREAMLIT_CONFIG, encoding="utf-8")
+    size = sum(p.stat().st_size for p in out.rglob("*") if p.is_file()) / 1e6
+    log(f"\nSpace prêt : {out}  ({size:.1f} Mo)")
+    log("Test local :  pip install streamlit plotly  puis  cd \"" + str(out) + "\"  &&  streamlit run app.py")
+    if a.upload:
+        if not a.repo_id or "/" not in a.repo_id:
+            sys.exit("--repo-id requis, de la forme  votrenom/Atlas_Climatique_RDC")
+        try:
+            from huggingface_hub import HfApi
+        except ImportError:
+            sys.exit("pip install huggingface_hub  puis relancez avec --upload")
+        api = HfApi(token=os.environ.get("HF_TOKEN") or None)
+        api.create_repo(a.repo_id, repo_type="space", space_sdk="docker", exist_ok=True)
+        api.upload_folder(folder_path=str(out), repo_id=a.repo_id, repo_type="space",
+                          commit_message="Atlas climatique RDC")
+        log(f"Publié : https://huggingface.co/spaces/{a.repo_id}  (la construction prend 2 à 5 minutes)")
+
+
+if __name__ == "__main__":
+    main()
