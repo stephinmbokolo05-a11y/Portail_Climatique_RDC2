@@ -13,7 +13,21 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="Atlas climatique RDC", page_icon="🌍", layout="wide")
-DATA = Path(__file__).parent / "data"
+HERE = Path(__file__).resolve().parent
+
+
+def find_data():
+    """Retrouve le dossier des données, où qu'il soit dans le dépôt (data/, space_hf/data/, racine...)."""
+    for c in (HERE / "data", HERE / "space_hf" / "data", HERE):
+        if (c / "meta.json").exists():
+            return c
+    for p in sorted(HERE.rglob("meta.json")):
+        if (p.parent / "provinces.geojson").exists():
+            return p.parent
+    return HERE / "data"
+
+
+DATA = find_data()
 
 # ------------------------------------------------------------------ apparence
 pio.templates["atlas"] = go.layout.Template(layout=dict(
@@ -102,8 +116,11 @@ def load_geo():
 
 
 if not (DATA / "meta.json").exists():
-    st.error("**Dossier `data/` introuvable.** Cette application a besoin du dossier `data/` (fichiers .csv.gz, provinces.geojson, "
-             "meta.json) à côté de `app.py`. Envoyez tout le contenu du dossier `space_hf` à la racine du dépôt GitHub.")
+    st.error("**Dossier `data/` introuvable.** Cette application a besoin des fichiers de données (fichiers .csv.gz, provinces.geojson, "
+             "meta.json). Envoyez le dossier `data` du dossier `space_hf` dans le dépôt GitHub, à côté de `app.py`.")
+    seen = sorted(p.name + ("/" if p.is_dir() else "") for p in HERE.iterdir() if not p.name.startswith("."))
+    st.write("Ce que l'application voit dans le dépôt :", seen)
+    st.write("Dossier cherché :", str(HERE / "data"))
     st.stop()
 META = json.loads((DATA / "meta.json").read_text(encoding="utf-8"))
 GEO = load_geo()
