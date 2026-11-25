@@ -17,13 +17,25 @@ HERE = Path(__file__).resolve().parent
 
 
 def find_data():
-    """Retrouve le dossier des données, où qu'il soit dans le dépôt (data/, space_hf/data/, racine...)."""
+    """Retrouve les donnees : dossier data/, space_hf/data/, racine, ou archive .zip (data.zip / atlas_data.zip)."""
     for c in (HERE / "data", HERE / "space_hf" / "data", HERE):
         if (c / "meta.json").exists():
             return c
     for p in sorted(HERE.rglob("meta.json")):
         if (p.parent / "provinces.geojson").exists():
             return p.parent
+    import tempfile
+    import zipfile
+    for zn in ("atlas_data.zip", "data.zip"):
+        z = HERE / zn
+        if z.exists():
+            d = Path(tempfile.gettempdir()) / ("atlas_" + zn.replace(".zip", ""))
+            if not any(d.rglob("meta.json")) if d.exists() else True:
+                d.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(z) as zf:
+                    zf.extractall(d)
+            for p in sorted(d.rglob("meta.json")):
+                return p.parent
     return HERE / "data"
 
 
@@ -117,7 +129,7 @@ def load_geo():
 
 if not (DATA / "meta.json").exists():
     st.error("**Dossier `data/` introuvable.** Cette application a besoin des fichiers de données (fichiers .csv.gz, provinces.geojson, "
-             "meta.json). Envoyez le dossier `data` du dossier `space_hf` dans le dépôt GitHub, à côté de `app.py`.")
+             "meta.json). Envoyez dans le dépôt GitHub, à côté de `app.py`, soit le dossier `data`, soit une archive `data.zip` contenant ce dossier.")
     seen = sorted(p.name + ("/" if p.is_dir() else "") for p in HERE.iterdir() if not p.name.startswith("."))
     st.write("Ce que l'application voit dans le dépôt :", seen)
     st.write("Dossier cherché :", str(HERE / "data"))
