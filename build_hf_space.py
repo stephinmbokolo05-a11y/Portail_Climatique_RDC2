@@ -32,6 +32,16 @@ import os
 import re
 import sqlite3
 import sys
+
+# Garde-fou : si ce fichier est envoye sur Streamlit Cloud par erreur sous le nom app.py, afficher un message clair
+if __name__ == "__main__" and "streamlit" in sys.modules:
+    import streamlit as st
+    st.error("**Ce fichier est le GÉNÉRATEUR `build_hf_space.py`, pas l'application.**  \n"
+             "Sur GitHub, `app.py` doit être le fichier **`pour_github\\app.py`** créé par ce générateur "
+             "(environ 1 Mo, il commence par `# -*- coding: utf-8 -*-` et contient `def page_portrait`). "
+             "Lancez `python build_hf_space.py` sur votre PC, puis envoyez `pour_github\\app.py` et "
+             "`pour_github\\requirements.txt` dans le dépôt.")
+    st.stop()
 import unicodedata
 from datetime import datetime
 from pathlib import Path
@@ -188,7 +198,7 @@ sdk: docker
 app_port: 8501
 pinned: false
 license: mit
-short_description: Climat, tendances, fiabilité et projections des 26 provinces de la RDC
+short_description: Climat, tendances et projections des provinces de la RDC
 ---
 
 # Atlas climatique de la RDC
@@ -229,6 +239,18 @@ REQUIREMENTS = "streamlit>=1.37,<1.50\npandas>=2.0\nnumpy>=1.26\nplotly>=5.20\n"
 
 APP_SOURCE = r'''# -*- coding: utf-8 -*-
 """Atlas climatique de la RDC : application Streamlit (Hugging Face Space)."""
+import streamlit as st
+
+st.set_page_config(page_title="Atlas climatique RDC", page_icon="🌍", layout="wide")
+_boot = st.empty()
+_boot.info("⏳ Chargement de l'atlas climatique de la RDC… (la première ouverture peut prendre une minute)")
+try:
+    import streamlit.components.v1 as _components
+    _components.html("<script>try{var d=window.parent.document.documentElement;d.setAttribute('lang','fr');"
+                     "d.setAttribute('translate','no');d.classList.add('notranslate');}catch(e){}</script>", height=0)
+except Exception:
+    pass
+
 import json
 import re
 from pathlib import Path
@@ -238,15 +260,65 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import plotly.io as pio
-import streamlit as st
 from plotly.subplots import make_subplots
 
-st.set_page_config(page_title="Atlas climatique RDC", page_icon="🌍", layout="wide")
-DATA = Path(__file__).parent / "data"
+HERE = Path(__file__).resolve().parent
+
+
+def embedded_bytes():
+    """Donnees integrees a la fin de ce fichier (mode autonome : un seul fichier app.py suffit)."""
+    import base64
+    begin, end = "# ===ATLAS" + "_DATA_BEGIN===", "# ===ATLAS" + "_DATA_END==="
+    try:
+        src = Path(__file__).read_text(encoding="utf-8")
+    except Exception:
+        return None
+    if begin not in src:
+        return None
+    body = src.split(begin, 1)[1].split(end, 1)[0]
+    b64 = "".join(l[1:].strip() for l in body.splitlines() if l.startswith("#"))
+    return base64.b64decode(b64) if b64 else None
+
+
+def find_data():
+    """Retrouve les donnees : integrees dans app.py, dossier data/, space_hf/data/, racine, ou archive .zip."""
+    import hashlib
+    import tempfile
+    import zipfile
+    blob = embedded_bytes()
+    if blob:
+        d = Path(tempfile.gettempdir()) / ("atlas_emb_" + hashlib.md5(blob[:4000]).hexdigest()[:12])
+        if not (d.exists() and any(d.rglob("meta.json"))):
+            d.mkdir(parents=True, exist_ok=True)
+            import io
+            with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+                zf.extractall(d)
+        for p in sorted(d.rglob("meta.json")):
+            return p.parent
+    for c in (HERE / "data", HERE / "space_hf" / "data", HERE):
+        if (c / "meta.json").exists():
+            return c
+    for p in sorted(HERE.rglob("meta.json")):
+        if (p.parent / "provinces.geojson").exists():
+            return p.parent
+    for zn in ("atlas_data.zip", "data.zip"):
+        z = HERE / zn
+        if z.exists():
+            d = Path(tempfile.gettempdir()) / ("atlas_" + zn.replace(".zip", ""))
+            if not (d.exists() and any(d.rglob("meta.json"))):
+                d.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(z) as zf:
+                    zf.extractall(d)
+            for p in sorted(d.rglob("meta.json")):
+                return p.parent
+    return HERE / "data"
+
+
+DATA = find_data()
 
 # ------------------------------------------------------------------ apparence
 pio.templates["atlas"] = go.layout.Template(layout=dict(
-    font=dict(family="Inter, Segoe UI, sans-serif", size=13, color="#1d2a24"),
+    font=dict(family="Segoe UI, system-ui, Arial, sans-serif", size=13, color="#1d2a24"),
     colorway=["#1f7a4d", "#c0482b", "#2a6fb0", "#b8860b", "#7a4bb0", "#2b9bb5", "#8a6d3b"],
     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
     xaxis=dict(gridcolor="rgba(120,120,110,.18)", zeroline=False, linecolor="rgba(120,120,110,.4)"),
@@ -256,8 +328,7 @@ pio.templates.default = "plotly+atlas"
 
 CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-html, body, [class*="css"], .stMarkdown, button, input { font-family: 'Inter', 'Segoe UI', sans-serif !important; }
+html, body, [class*="css"], .stMarkdown, button, input { font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, Roboto, Arial, sans-serif !important; }
 .block-container { padding-top: 1.1rem; padding-bottom: 3rem; max-width: 1320px; }
 h1, h2, h3 { letter-spacing: -0.02em; }
 .hero { position: relative; overflow: hidden; background: linear-gradient(115deg, #0b4a32 0%, #1f7a4d 42%, #2a6fb0 100%);
@@ -330,6 +401,13 @@ def load_geo():
     return json.loads((DATA / "provinces.geojson").read_text(encoding="utf-8"))
 
 
+if not (DATA / "meta.json").exists():
+    st.error("**Dossier `data/` introuvable.** Cette application a besoin des fichiers de données (fichiers .csv.gz, provinces.geojson, "
+             "meta.json). Envoyez dans le dépôt GitHub, à côté de `app.py`, soit le dossier `data`, soit une archive `data.zip` contenant ce dossier.")
+    seen = sorted(p.name + ("/" if p.is_dir() else "") for p in HERE.iterdir() if not p.name.startswith("."))
+    st.write("Ce que l'application voit dans le dépôt :", seen)
+    st.write("Dossier cherché :", str(HERE / "data"))
+    st.stop()
 META = json.loads((DATA / "meta.json").read_text(encoding="utf-8"))
 GEO = load_geo()
 PROV = load("provinces")
@@ -341,6 +419,7 @@ ANN, SPI, SPIA, HZ = load("annual"), load("spi"), load("spi_annual"), load("haza
 RAIN, CONS, VAL, BRK = load("rain_sources"), load("consensus"), load("validation"), load("breaks")
 NMON, PROJ = load("nasa_monthly"), load("proj")
 STATUS = META.get("rain_status", "inconnue")
+_boot.empty()
 
 SRC = {"nasa": ("NASA POWER", "#c0482b"), "era5": ("ERA5", "#7a4bb0"), "gpcc": ("GPCC", "#2a6fb0"),
        "tamsat": ("TAMSAT", "#1f8a5b"), "chirps": ("CHIRPS", "#b8860b")}
@@ -807,6 +886,13 @@ PAGES[st.sidebar.radio("Navigation", list(PAGES), label_visibility="collapsed")]
 st.sidebar.markdown("---")
 st.sidebar.caption("Données : NASA POWER, ERA5, GPCC, TAMSAT, CMIP6. Voir « Méthodes » pour les limites.")
 st.markdown('<div class="foot">Atlas climatique de la RDC · tendances de pluie non établies · projections indicatives (modèle et scénario uniques)</div>', unsafe_allow_html=True)
+
+with st.sidebar.expander("Diagnostic technique"):
+    import plotly
+    st.caption(f"Streamlit {st.__version__} · pandas {pd.__version__} · plotly {plotly.__version__}")
+    st.caption(f"Données : {DATA}")
+    st.caption(f"Tables : normales {len(NORM)}, climat {len(CLIM)}, tendances {len(TR)}, pluie par source {len(RAIN)}, projections {len(PROJ)}")
+_boot.empty()
 '''
 
 
@@ -939,6 +1025,35 @@ def main():
     (out / "requirements.txt").write_text(REQUIREMENTS, encoding="utf-8")
     (out / ".streamlit").mkdir(exist_ok=True)
     (out / ".streamlit" / "config.toml").write_text(STREAMLIT_CONFIG, encoding="utf-8")
+    import base64
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for p in sorted((out / "data").iterdir()):
+            z.write(p, "data/" + p.name)
+    (out / "data.zip").write_bytes(buf.getvalue())
+    # Version AUTONOME pour GitHub / Streamlit Cloud : donnees integrees dans app.py (un seul fichier a envoyer)
+    gh = out.parent / "pour_github"
+    gh.mkdir(parents=True, exist_ok=True)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    begin, end = "# ===ATLAS" + "_DATA_BEGIN===", "# ===ATLAS" + "_DATA_END==="
+    body = "\n".join("# " + b64[i:i + 100] for i in range(0, len(b64), 100))
+    (gh / "app.py").write_text(APP_SOURCE + "\n\n" + begin + "\n" + body + "\n" + end + "\n", encoding="utf-8")
+    (gh / "requirements.txt").write_text(REQUIREMENTS, encoding="utf-8")
+    mo = (gh / "app.py").stat().st_size / 1e6
+    log("\n" + "=" * 74)
+    log("TERMINE. Envoyez sur GitHub UNIQUEMENT ces 2 fichiers (le dossier va s'ouvrir) :")
+    log(f"   {gh}\\app.py   ({mo:.1f} Mo)   <- doit faire environ 1 Mo")
+    log(f"   {gh}\\requirements.txt")
+    log("ATTENTION : ne jamais envoyer build_hf_space.py sous le nom app.py.")
+    if mo < 0.3:
+        log("!!! app.py est trop petit : les donnees ne sont pas integrees. Envoyez-moi ce message.")
+    log("=" * 74)
+    try:
+        os.startfile(str(gh))          # Windows : ouvre le dossier pour vous
+    except Exception:
+        pass
     size = sum(p.stat().st_size for p in out.rglob("*") if p.is_file()) / 1e6
     log(f"\nSpace prêt : {out}  ({size:.1f} Mo)")
     log("Test local :  pip install streamlit plotly  puis  cd \"" + str(out) + "\"  &&  streamlit run app.py")

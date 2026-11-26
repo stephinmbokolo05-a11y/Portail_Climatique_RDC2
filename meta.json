@@ -1,0 +1,12 @@
+{
+ "built": "20/11/2026 11:04",
+ "analysis": "normales 1991-2020; tendances 1981-2024",
+ "verdict": "INCONCLUANT : les sources indépendantes divergent entre elles",
+ "rain_status": "non_etablie",
+ "sources": [
+  "era5",
+  "gpcc",
+  "nasa",
+  "tamsat"
+ ]
+}
