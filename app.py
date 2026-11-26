@@ -32,6 +32,16 @@ import os
 import re
 import sqlite3
 import sys
+
+# Garde-fou : si ce fichier est envoye sur Streamlit Cloud par erreur sous le nom app.py, afficher un message clair
+if __name__ == "__main__" and "streamlit" in sys.modules:
+    import streamlit as st
+    st.error("**Ce fichier est le GÉNÉRATEUR `build_hf_space.py`, pas l'application.**  \n"
+             "Sur GitHub, `app.py` doit être le fichier **`pour_github\\app.py`** créé par ce générateur "
+             "(environ 1 Mo, il commence par `# -*- coding: utf-8 -*-` et contient `def page_portrait`). "
+             "Lancez `python build_hf_space.py` sur votre PC, puis envoyez `pour_github\\app.py` et "
+             "`pour_github\\requirements.txt` dans le dépôt.")
+    st.stop()
 import unicodedata
 from datetime import datetime
 from pathlib import Path
