@@ -229,6 +229,18 @@ REQUIREMENTS = "streamlit>=1.37,<1.50\npandas>=2.0\nnumpy>=1.26\nplotly>=5.20\n"
 
 APP_SOURCE = r'''# -*- coding: utf-8 -*-
 """Atlas climatique de la RDC : application Streamlit (Hugging Face Space)."""
+import streamlit as st
+
+st.set_page_config(page_title="Atlas climatique RDC", page_icon="🌍", layout="wide")
+_boot = st.empty()
+_boot.info("⏳ Chargement de l'atlas climatique de la RDC… (la première ouverture peut prendre une minute)")
+try:
+    import streamlit.components.v1 as _components
+    _components.html("<script>try{var d=window.parent.document.documentElement;d.setAttribute('lang','fr');"
+                     "d.setAttribute('translate','no');d.classList.add('notranslate');}catch(e){}</script>", height=0)
+except Exception:
+    pass
+
 import json
 import re
 from pathlib import Path
@@ -238,10 +250,8 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import plotly.io as pio
-import streamlit as st
 from plotly.subplots import make_subplots
 
-st.set_page_config(page_title="Atlas climatique RDC", page_icon="🌍", layout="wide")
 HERE = Path(__file__).resolve().parent
 
 
@@ -298,7 +308,7 @@ DATA = find_data()
 
 # ------------------------------------------------------------------ apparence
 pio.templates["atlas"] = go.layout.Template(layout=dict(
-    font=dict(family="Inter, Segoe UI, sans-serif", size=13, color="#1d2a24"),
+    font=dict(family="Segoe UI, system-ui, Arial, sans-serif", size=13, color="#1d2a24"),
     colorway=["#1f7a4d", "#c0482b", "#2a6fb0", "#b8860b", "#7a4bb0", "#2b9bb5", "#8a6d3b"],
     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
     xaxis=dict(gridcolor="rgba(120,120,110,.18)", zeroline=False, linecolor="rgba(120,120,110,.4)"),
@@ -308,8 +318,7 @@ pio.templates.default = "plotly+atlas"
 
 CSS = """
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-html, body, [class*="css"], .stMarkdown, button, input { font-family: 'Inter', 'Segoe UI', sans-serif !important; }
+html, body, [class*="css"], .stMarkdown, button, input { font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, Roboto, Arial, sans-serif !important; }
 .block-container { padding-top: 1.1rem; padding-bottom: 3rem; max-width: 1320px; }
 h1, h2, h3 { letter-spacing: -0.02em; }
 .hero { position: relative; overflow: hidden; background: linear-gradient(115deg, #0b4a32 0%, #1f7a4d 42%, #2a6fb0 100%);
@@ -400,6 +409,7 @@ ANN, SPI, SPIA, HZ = load("annual"), load("spi"), load("spi_annual"), load("haza
 RAIN, CONS, VAL, BRK = load("rain_sources"), load("consensus"), load("validation"), load("breaks")
 NMON, PROJ = load("nasa_monthly"), load("proj")
 STATUS = META.get("rain_status", "inconnue")
+_boot.empty()
 
 SRC = {"nasa": ("NASA POWER", "#c0482b"), "era5": ("ERA5", "#7a4bb0"), "gpcc": ("GPCC", "#2a6fb0"),
        "tamsat": ("TAMSAT", "#1f8a5b"), "chirps": ("CHIRPS", "#b8860b")}
@@ -866,6 +876,13 @@ PAGES[st.sidebar.radio("Navigation", list(PAGES), label_visibility="collapsed")]
 st.sidebar.markdown("---")
 st.sidebar.caption("Données : NASA POWER, ERA5, GPCC, TAMSAT, CMIP6. Voir « Méthodes » pour les limites.")
 st.markdown('<div class="foot">Atlas climatique de la RDC · tendances de pluie non établies · projections indicatives (modèle et scénario uniques)</div>', unsafe_allow_html=True)
+
+with st.sidebar.expander("Diagnostic technique"):
+    import plotly
+    st.caption(f"Streamlit {st.__version__} · pandas {pd.__version__} · plotly {plotly.__version__}")
+    st.caption(f"Données : {DATA}")
+    st.caption(f"Tables : normales {len(NORM)}, climat {len(CLIM)}, tendances {len(TR)}, pluie par source {len(RAIN)}, projections {len(PROJ)}")
+_boot.empty()
 '''
 
 
